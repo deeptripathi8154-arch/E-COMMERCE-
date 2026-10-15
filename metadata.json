@@ -1,0 +1,6 @@
+{
+  "name": "Harvinder Telecom E-Commerce",
+  "description": "Full-stack electronics retail platform for Harvinder Telecom (Haldwani, Uttarakhand) featuring smartphones, accessories, Indian PIN delivery checks, GST invoices, and local admin IMEI management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
