@@ -1,0 +1,370 @@
+name: Project quality checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Typecheck, production build and offline checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Use the committed lockfile whenever it exists. The retry settings help
+      # transient network failures; they do not bypass TLS or use a third-party mirror.
+      - name: Install open-source dependencies
+        shell: bash
+        run: |
+          npm config set fetch-retries 3
+          npm config set fetch-retry-mintimeout 20000
+          npm config set fetch-retry-maxtimeout 120000
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Production build
+        run: npm run build
+
+      - name: Verify storefront foundation
+        run: npm run verify:phase1
+
+      - name: Verify database and security foundation
+        run: npm run verify:phase2
+
+      - name: Verify SQLite migration directly
+        run: python scripts/verify-d1-schema.py
+
+      # This workflow validates code only. It does not create Cloudflare resources,
+      # modify production data, enable billing, or deploy the site.
+
+# Build blocker diagnosis and resolution
+
+## Root cause found
+
+The earlier build was first blocked because the execution environment could not resolve `registry.npmjs.org` (`EAI_AGAIN`). That is an environment/network failure, not a compiler diagnostic.
+
+A review against the official vinext App Router setup also found missing required dependencies in `package.json`:
+
+- `react-server-dom-webpack`, the React Server Components runtime.
+- `@vitejs/plugin-rsc`, the Vite React Server Components plugin.
+- `@vitejs/plugin-react`, included in the official Vite/vinext setup dependencies.
+
+The manifest now declares these packages and keeps `react`, `react-dom`, and `react-server-dom-webpack` on the same exact version (`19.3.0`) to avoid RSC version mismatch. `scripts/verify-phase2.mjs` now checks for these dependencies and version alignment.
+
+The Wrangler configuration also had a concrete deployment defect: `assets` lacked its required `directory`. It now points to `./dist/client` (the vinext client build output) and sets `run_worker_first: true`, so the authentication/admin API requests are not short-circuited by static asset handling. The Phase 2 verifier now checks both settings.
+
+## What has been done
+
+- Added the missing App Router RSC dependencies.
+- Added consistency checks so missing RSC dependencies are detected by the offline verifier.
+- Added `.github/workflows/quality.yml` to install dependencies and run TypeScript checks, the full production build, the Phase 1/Phase 2 checks, and SQLite migration checks on GitHub-hosted runners.
+- The workflow is validation-only; it does not deploy, create Cloudflare resources, or require Cloudflare secrets.
+
+## What is and is not verified
+
+Offline source and schema checks can be run without npm network access. The full build still cannot honestly be marked passed in the current container because npm cannot resolve `registry.npmjs.org` and the required packages therefore are not installed.
+
+After pushing this commit to GitHub, inspect the **Project quality checks** workflow. It will verify dependency installation, semantic TypeScript checking, production build and local schema checks. If any step fails, use that actual log as the next defect report; do not assume the app is error-free just because syntax checks passed.
+
+## Local reproduction
+
+```bash
+npm install --no-audit --no-fund
+npm run typecheck
+npm run build
+npm run verify:phase1
+npm run verify:phase2
+python scripts/verify-d1-schema.py
+```
+
+If installation fails with `EAI_AGAIN`, restore DNS/network access to the official npm registry and rerun the commands. Do not bypass certificate validation or use untrusted package mirrors.
+
+# GitHub Setup Guide — Harvinder Telecom E-Commerce
+
+This guide is for applying the build-fix files to the **actual e-commerce repository**. Do not apply them to the separate `Harvinder Command` BI-dashboard project.
+
+## Important status note
+
+The project’s offline source checks and SQLite migration checks have passed in the prepared package. The full dependency install and production build have **not yet been confirmed** because the earlier environment could not resolve `registry.npmjs.org` (`EAI_AGAIN`). The GitHub Actions workflow added here will run the real install, TypeScript check, production build, and offline database checks after you push the branch. Do not call the project error-free until that workflow passes.
+
+## Files included in the build-fix overlay
+
+Copy these paths into the root of your existing e-commerce repository, preserving the directory structure:
+
+- `package.json` — declares the Vite/vinext App Router dependencies with the React and React Server Components runtime versions aligned.
+- `wrangler.jsonc` — contains the Cloudflare Worker, D1 and R2 bindings. `database_id` is still a placeholder and must not be used for a live deployment.
+- `.github/workflows/quality.yml` — installs dependencies (preferring `npm ci` if a lockfile exists), then runs typecheck, production build and offline checks. It does not deploy.
+- `docs/BUILD_BLOCKER.md` — records the build blocker and recovery steps.
+- `docs/GITHUB_SETUP_GUIDE.md` — this guide.
+- `docs/PULL_REQUEST_DESCRIPTION.md` — suggested PR title and description.
+
+Do not copy the outer directory name inside the repository. Copy its **contents** into your repository root. If you have additional uncommitted work, back it up before replacing a file.
+
+## Recommended method on Windows: GitHub Desktop
+
+### Step 1 — Open the right repository
+
+1. Open GitHub.com and navigate to your **Harvinder Telecom E-Commerce application source repository**.
+2. Check the repository name and confirm its README describes the e-commerce storefront, product catalogue, database and inventory—not only the BI dashboard.
+3. If the repository is not on your PC, click **Code → Open with GitHub Desktop** or clone it from GitHub Desktop using **File → Clone repository**.
+4. In GitHub Desktop, use **Repository → Show in Explorer** to open the local repository folder.
+
+### Step 2 — Create the fix branch before changing files
+
+In GitHub Desktop:
+
+1. Select **Current Branch**.
+2. Select **New Branch**.
+3. Enter `fix/build-and-ci`.
+4. Create the branch from the current `main` branch (or your repository’s default branch).
+
+Do not commit this fix directly to `main` unless you explicitly prefer that workflow.
+
+### Step 3 — Download and extract the overlay
+
+1. Download the file named `harvinder-telecom-ecommerce-github-fix-overlay.zip` from this conversation.
+2. In Windows File Explorer, right-click the ZIP and choose **Extract All**.
+3. Open the extracted overlay folder.
+4. Copy the files and folders inside it into the root of your cloned repository. Keep folders such as `.github/workflows` and `docs` in the same relative paths.
+5. If Windows does not show dot-folders, use File Explorer **View → Show → Hidden items**.
+6. Replace only the same-named files listed in the overlay. Do not delete your other app files.
+
+### Step 4 — Install and test locally
+
+Install Node.js 22 (at least 22.12 for Vite 8 compatibility) and Python 3.13 or newer if not already available. Close and reopen your terminal after installation.
+
+In the repository root, open PowerShell or the terminal built into GitHub Desktop and run:
+
+```powershell
+node --version
+npm --version
+python --version
+npm install --no-audit --no-fund
+npm run typecheck
+npm run build
+npm run verify:phase1
+npm run verify:phase2
+python scripts/verify-d1-schema.py
+```
+
+The package installation must complete first. When `npm install` succeeds, it creates `package-lock.json`. **Keep and commit that file** so dependency versions are reproducible; the GitHub workflow will then use `npm ci` automatically.
+
+If `npm install` ends with `EAI_AGAIN`, `ENOTFOUND`, `ECONNRESET`, or a timeout, the registry/network was not reachable. Check your internet/DNS connection and retry the official npm registry. Do not disable TLS certificate validation or change to an unknown package mirror. A network error is not proof of a code error, but it also does not count as a successful build.
+
+### Step 5 — Review changes in GitHub Desktop
+
+1. Open the **Changes** tab.
+2. Review every changed filename and diff.
+3. Confirm no `.env`, `.dev.vars`, credentials, API keys, `node_modules`, or build output are being committed.
+4. Confirm `package-lock.json` appears after a successful install.
+5. Use this commit summary:
+
+   `fix: resolve build dependencies and add automated quality checks`
+
+6. Use this extended description:
+
+   `Align React and React Server Components dependencies, document the build blocker, configure a CI workflow for typechecking/build/offline database checks, and keep deployment and paid billing disabled.`
+
+7. Click **Commit to fix/build-and-ci**.
+
+### Step 6 — Push the branch
+
+Click **Push origin** in GitHub Desktop. This uploads the new branch to GitHub; it does not deploy the site.
+
+### Step 7 — Open the pull request
+
+1. Click **Create Pull Request** in GitHub Desktop, or open the repository on GitHub and select **Compare & pull request** for `fix/build-and-ci`.
+2. Base: `main` (or the default branch). Compare: `fix/build-and-ci`.
+3. Use the title:
+
+   `fix: resolve build dependencies and add automated quality checks`
+
+4. Copy the content from [`PULL_REQUEST_DESCRIPTION.md`](PULL_REQUEST_DESCRIPTION.md) into the description.
+5. Create the pull request. Keep it open until the quality checks finish.
+
+### Step 8 — Read the workflow result
+
+1. Open the repository on GitHub.
+2. Select **Actions**.
+3. Open **Project quality checks** for the new branch or pull request.
+4. Wait for these steps to complete:
+   - Install open-source dependencies
+   - TypeScript typecheck
+   - Production build
+   - Verify storefront foundation
+   - Verify database and security foundation
+   - Verify SQLite migration directly
+5. If all steps are green, the checks in this workflow passed for that commit. If any step is red, open it, expand the failed step, and copy the actual error log before making another change.
+
+A passing CI build still does **not** prove live D1, R2, real authentication, email, or deployment works. Those require separate tests with correctly configured resources. The workflow intentionally does not deploy or provision remote resources.
+
+## Optional: GitHub website-only route
+
+If you cannot use GitHub Desktop, you can edit text files one at a time using GitHub’s web editor, but uploading the overlay ZIP alone will not unpack it into your repository. In the repository, use **Add file → Create new file** for `.github/workflows/quality.yml` and the new docs, and edit the existing `package.json`, `wrangler.jsonc`, and `docs/BUILD_BLOCKER.md` using their **Edit** buttons. Preserve the existing source; do not replace the repository with only the ZIP's documentation. GitHub Desktop is safer for this multi-file update.
+
+## What must remain unconfigured for now
+
+- Do not run `npm run deploy` yet.
+- Do not apply remote migrations yet.
+- Do not replace the placeholder `database_id` with a guessed value.
+- Do not commit `.dev.vars`, `.env`, Better Auth secrets or Cloudflare tokens.
+- Do not enable paid services or automatic plan upgrades.
+- Do not take real orders until database, authentication, image storage, stock reservation, payment handling, and recovery are tested end to end.
+
+## If you need help debugging a failed run
+
+Send the exact failed GitHub Actions step name and the full error excerpt around the first error. Do not send access tokens, passwords, `.env` contents, or secrets.
+
+## Official references
+
+- GitHub Desktop: https://docs.github.com/en/desktop/overview/about-github-desktop
+- Create a pull request: https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/about-pull-requests
+- Cloudflare vinext: https://github.com/cloudflare/vinext
+- Cloudflare Workers Vite plugin: https://developers.cloudflare.com/workers/vite-plugin/
+- npm install: https://docs.npmjs.com/cli/commands/npm-install
+
+## Summary
+
+This pull request addresses the e-commerce project's build-readiness setup and adds a repeatable GitHub Actions quality workflow.
+
+## Changes
+
+- Align the React and React Server Components dependencies for the vinext App Router setup.
+- Validate Cloudflare Worker asset configuration and preserve the unconfigured D1 placeholder.
+- Add/refresh the `Project quality checks` workflow for dependency installation, TypeScript, production build, storefront checks, Phase 2 checks and SQLite migration checks.
+- Document the original npm registry DNS blocker and the correct recovery procedure.
+- Add step-by-step GitHub Desktop and pull-request instructions.
+
+## Safety
+
+- The workflow does not deploy the site or create remote Cloudflare resources.
+- No production secrets or payment credentials are included.
+- Paid billing remains disabled.
+
+## Verification status
+
+- Offline storefront structural checks: pass in the prepared environment.
+- Phase 2/database schema checks: pass in the prepared environment.
+- Full dependency install and production build: must be confirmed by this pull request's Actions run.
+- Live D1, R2, authentication and end-to-end checkout: not covered by this validation-only workflow.
+
+## Reviewer checklist
+
+- [ ] Confirm the change is in the e-commerce repository, not the BI dashboard repository.
+- [ ] Confirm no secrets or local environment files are committed.
+- [ ] Confirm GitHub Actions passes before merging.
+- [ ] Keep production deployment disabled until the live integration tests are completed.
+
+{
+  "name": "harvinder-telecom-ecommerce",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-budget-first Harvinder Telecom electronics e-commerce storefront foundation.",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "deploy": "node scripts/deploy-guard.mjs && npm run build && wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "verify:phase1": "node scripts/verify-phase1.mjs",
+    "verify:phase2": "node scripts/verify-phase2.mjs",
+    "db:apply:local": "wrangler d1 migrations apply harvinder-telecom-db --local",
+    "db:apply:remote": "node scripts/apply-remote-migrations.mjs",
+    "db:local": "wrangler d1 execute harvinder-telecom-db --local",
+    "admin:promote": "node scripts/promote-admin.mjs",
+    "validate:offline": "npm run verify:phase1 && npm run verify:phase2",
+    "validate": "npm run typecheck && npm run build && npm run validate:offline"
+  },
+  "dependencies": {
+    "better-auth": "^1.7.7",
+    "lucide-react": "^0.468.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-server-dom-webpack": "19.3.0",
+    "vinext": "^1.1.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.64.0",
+    "@cloudflare/workers-types": "^5.20261014.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "@vitejs/plugin-rsc": "^0.5.34",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.0",
+    "vite": "^8.3.4",
+    "wrangler": "^4.149.0"
+  }
+}
+
+# Harvinder Telecom E-Commerce — Build Fix Overlay
+
+This ZIP contains only the files to copy into the root of the existing e-commerce repository. It is not a complete standalone application.
+
+1. Create branch `fix/build-and-ci` from `main`.
+2. Extract this ZIP.
+3. Copy the contents (not an outer folder) to the existing repository root, preserving `.github/workflows` and `docs` paths.
+4. Install dependencies, run all checks, commit, push, open a PR, and wait for the GitHub Actions workflow.
+5. Read `docs/GITHUB_SETUP_GUIDE.md` for full Windows/GitHub Desktop instructions.
+
+No deployment or remote Cloudflare resources are created by these files. A passing build is not yet claimed; it must be confirmed by CI.
+
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "harvinder-telecom-store",
+  "compatibility_date": "2026-10-14",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "main": "./worker/index.ts",
+  "preview_urls": true,
+  "assets": {
+    "not_found_handling": "none",
+    "binding": "ASSETS",
+    "directory": "./dist/client",
+    "run_worker_first": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "harvinder-telecom-db",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "PRODUCT_IMAGES",
+      "bucket_name": "harvinder-telecom-products"
+    }
+  ]
+}
